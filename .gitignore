@@ -1,0 +1,20 @@
+# Foundry build artifacts
+/out/
+/cache/
+
+# Dependencies (188MB of third-party code; restore with `forge install` — see README)
+/lib/
+
+# Env / secrets (never commit keys; we sign via keystore in ~/.foundry)
+.env
+*.key
+
+# Local scratch files not part of the project
+tweet-*.html
+tweet-*.png
+
+# Dry-run simulation artifacts (keep only the real broadcast record)
+/broadcast/**/dry-run/
+
+# OS
+.DS_Store
