@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.request
 
 RPC = os.environ.get("MAINNET_RPC_URL", "https://ethereum-rpc.publicnode.com")
@@ -23,7 +24,7 @@ USDC_VAULT = "0x797DD80692c3b2dAdabCe8e30C07fDE5307D48a9"
 USDT_VAULT = "0x313603FA690301b0CaeEf8069c065862f9162162"
 DEPLOY_BLOCK = 25276348
 INITIAL_USD = 200  # initial deposit, USD
-CHUNK = 9000       # block span per eth_getLogs request (stay under provider caps)
+CHUNK = 2000       # block span per eth_getLogs request; auto-bisects if too wide
 
 
 # ---------------------------------------------------------------- keccak256
@@ -97,11 +98,24 @@ def rpc(method, params):
     req = urllib.request.Request(RPC, data=body, headers={"Content-Type": "application/json"})
     for attempt in range(5):
         try:
-            r = json.loads(urllib.request.urlopen(req, timeout=30).read())
+            r = json.loads(urllib.request.urlopen(req, timeout=60).read())
             if "error" in r:
                 raise RuntimeError(r["error"])
             return r["result"]
-        except Exception as e:
+        except urllib.error.HTTPError as e:
+            # Surface the provider's actual message (e.g. Alchemy range/size limits).
+            try:
+                body = json.loads(e.read())
+                msg = body.get("error", body)
+            except Exception:
+                msg = f"HTTP {e.code}"
+            err = RuntimeError(msg)
+            if 400 <= e.code < 500:
+                raise err          # client error: deterministic, don't retry
+            if attempt == 4:
+                raise err
+            time.sleep(2 ** attempt)
+        except Exception:
             if attempt == 4:
                 raise
             time.sleep(2 ** attempt)
@@ -139,18 +153,29 @@ def debt(vault):
 
 
 # ---------------------------------------------------------------- logs
+def _get_logs_range(start, end, depth=0):
+    """Fetch logs for [start, end], auto-bisecting if the provider rejects the
+    range (too wide / too many results -> HTTP 400 on Alchemy & others)."""
+    try:
+        return rpc("eth_getLogs", [{
+            "address": POOL,
+            "fromBlock": hex(start),
+            "toBlock": hex(end),
+        }])
+    except Exception as e:
+        if start >= end or depth > 40:
+            raise RuntimeError(f"eth_getLogs failed for [{start},{end}]: {e}")
+        mid = (start + end) // 2
+        return _get_logs_range(start, mid, depth + 1) + _get_logs_range(mid + 1, end, depth + 1)
+
+
 def get_logs():
     latest = int(rpc("eth_blockNumber", []), 16)
     logs = []
     start = DEPLOY_BLOCK
     while start <= latest:
         end = min(start + CHUNK, latest)
-        chunk = rpc("eth_getLogs", [{
-            "address": POOL,
-            "fromBlock": hex(start),
-            "toBlock": hex(end),
-        }])
-        logs.extend(chunk)
+        logs.extend(_get_logs_range(start, end))
         start = end + 1
     return logs, latest
 
