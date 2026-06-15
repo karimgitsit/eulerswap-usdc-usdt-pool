@@ -164,6 +164,26 @@ def debt(vault):
     return call_uint(vault, sel_debtOf + addr_arg(ACCT))
 
 
+# ---------------------------------------------------------------- carry / APY
+SECONDS_PER_YEAR = 31_556_952
+sel_interestRate = selector("interestRate()")   # borrow rate, per-second, 1e27-scaled
+sel_interestFee = selector("interestFee()")     # protocol cut of interest, 1e4-scaled
+sel_cash = selector("cash()")
+sel_totalBorrows = selector("totalBorrows()")
+
+
+def vault_rates(vault):
+    """Return (borrow_apy, supply_apy, utilization) for an EVK vault."""
+    spy = call_uint(vault, sel_interestRate)                 # ray (1e27) per second
+    borrow_apy = (1 + spy / 1e27) ** SECONDS_PER_YEAR - 1
+    cash = call_uint(vault, sel_cash)
+    borrows = call_uint(vault, sel_totalBorrows)
+    util = borrows / (cash + borrows) if (cash + borrows) else 0.0
+    fee = call_uint(vault, sel_interestFee) / 1e4            # e.g. 1000 -> 10%
+    supply_apy = borrow_apy * util * (1 - fee)
+    return borrow_apy, supply_apy, util
+
+
 # ---------------------------------------------------------------- logs
 def _logs_for(start, end):
     return rpc("eth_getLogs", [{
@@ -260,6 +280,26 @@ def main():
     print(f"USDT: supplied {usdt_sup/1e6:>14,.4f}  debt {usdt_debt/1e6:,.4f}")
     print(f"NAV (equity)   = ${nav/1e6:,.4f}")
     print(f"PnL (stables)  = ${(nav - INITIAL_USD*10**6)/1e6:+,.4f}   (excludes ETH gas)")
+
+    # ---- Carry economics: does the leveraged inventory pay or bleed? ----
+    try:
+        ub, us, uu = vault_rates(USDC_VAULT)
+        tb, ts, tu = vault_rates(USDT_VAULT)
+        income = (usdc_sup * us + usdt_sup * ts) / 1e6
+        cost = (usdc_debt * ub + usdt_debt * tb) / 1e6
+        net = income - cost
+        print("\n=== Carry economics (live vault APYs) ===")
+        print(f"USDC vault: borrow {ub*100:5.2f}%  supply {us*100:5.2f}%  (util {uu*100:4.1f}%)")
+        print(f"USDT vault: borrow {tb*100:5.2f}%  supply {ts*100:5.2f}%  (util {tu*100:4.1f}%)")
+        print(f"supply income  = +${income:,.2f}/yr")
+        print(f"borrow cost    = -${cost:,.2f}/yr")
+        nav_usd = nav / 1e6
+        pct = (net / nav_usd * 100) if nav_usd else 0.0
+        verdict = "POSITIVE — scaling volume scales profit" if net >= 0 else \
+                  "NEGATIVE — scaling volume scales losses (fix before growing)"
+        print(f"net carry      = ${net:+,.2f}/yr  ({pct:+.2f}% of NAV)  [pre-swap-fees]  -> {verdict}")
+    except Exception as e:
+        print(f"\n[carry economics unavailable: {e}]")
 
     logs, latest = get_logs()
     by_topic = {}
