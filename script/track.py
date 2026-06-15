@@ -178,9 +178,14 @@ def _suggested_window(msg):
     return None
 
 
-def _learn_window(start):
-    """Find the largest block window the RPC will accept for eth_getLogs."""
-    for w in (CHUNK, 2000, 1000, 100, 10):
+def _learn_window(start, latest):
+    """Find the largest block window the RPC will accept for eth_getLogs.
+    Tries the WHOLE span first — most RPCs cap by result *size*, not block
+    *count*, so a low-traffic pool comes back in a single request."""
+    full = latest - start + 1
+    for w in (full, 100_000, 10_000, 2000, 1000, 100, 10):
+        if w > full:
+            continue
         try:
             _logs_for(start, start + w - 1)
             return w
@@ -193,7 +198,7 @@ def _learn_window(start):
 
 def get_logs():
     latest = int(rpc("eth_blockNumber", []), 16)
-    win = _learn_window(DEPLOY_BLOCK)
+    win = _learn_window(DEPLOY_BLOCK, latest)
     ranges = []
     s = DEPLOY_BLOCK
     while s <= latest:
@@ -202,19 +207,23 @@ def get_logs():
         s = e + 1
     total = len(ranges)
     print(f"  scanning {latest - DEPLOY_BLOCK + 1:,} blocks in {total:,} window(s) "
-          f"of {win} (RPC cap)…", file=sys.stderr)
-    if total > 800:
-        print("  [!] free-tier RPC forces a tiny window; this may take a few "
-              "minutes. A wider-range RPC would be much faster.", file=sys.stderr)
+          f"of {win:,} (RPC getLogs cap)…", file=sys.stderr)
+    if total > 500:
+        print(f"\n  [!] This RPC caps getLogs at a tiny {win}-block window, so the "
+              f"sweep needs {total:,} requests and will likely hit rate limits.\n"
+              f"      Re-run against a wider-range RPC, e.g.:\n"
+              f"        MAINNET_RPC_URL='https://ethereum-rpc.publicnode.com' "
+              f"python3 script/track.py\n", file=sys.stderr)
 
     logs = []
     done = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+    workers = WORKERS if total > 1 else 1
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_logs_for, a, b): (a, b) for a, b in ranges}
         for f in concurrent.futures.as_completed(futs):
             logs.extend(f.result())
             done += 1
-            if done % 100 == 0 or done == total:
+            if total > 1 and (done % 100 == 0 or done == total):
                 print(f"  …{done:,}/{total:,} windows", file=sys.stderr)
     return logs, latest
 
