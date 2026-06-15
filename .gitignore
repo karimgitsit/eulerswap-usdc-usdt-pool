@@ -16,5 +16,9 @@ tweet-*.png
 # Dry-run simulation artifacts (keep only the real broadcast record)
 /broadcast/**/dry-run/
 
+# Python bytecode cache (from script/track.py)
+__pycache__/
+*.pyc
+
 # OS
 .DS_Store
