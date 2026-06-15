@@ -10,8 +10,10 @@ Robust against the exact Swap-event layout: it fetches *all* logs emitted by the
 pool since deploy and identifies swaps by matching candidate event signatures, so
 it won't silently report zero if the ABI guess is slightly off.
 """
+import concurrent.futures
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -24,7 +26,8 @@ USDC_VAULT = "0x797DD80692c3b2dAdabCe8e30C07fDE5307D48a9"
 USDT_VAULT = "0x313603FA690301b0CaeEf8069c065862f9162162"
 DEPLOY_BLOCK = 25276348
 INITIAL_USD = 200  # initial deposit, USD
-CHUNK = 2000       # block span per eth_getLogs request; auto-bisects if too wide
+CHUNK = 2000       # preferred eth_getLogs window; auto-shrinks to the RPC's cap
+WORKERS = 12       # parallel eth_getLogs requests (helps when the cap is tiny)
 
 
 # ---------------------------------------------------------------- keccak256
@@ -110,8 +113,13 @@ def rpc(method, params):
             except Exception:
                 msg = f"HTTP {e.code}"
             err = RuntimeError(msg)
+            if e.code in (429, 500, 502, 503, 504):
+                if attempt == 4:
+                    raise err      # rate-limit / transient: retry with backoff
+                time.sleep(2 ** attempt)
+                continue
             if 400 <= e.code < 500:
-                raise err          # client error: deterministic, don't retry
+                raise err          # other client errors are deterministic, don't retry
             if attempt == 4:
                 raise err
             time.sleep(2 ** attempt)
@@ -153,30 +161,61 @@ def debt(vault):
 
 
 # ---------------------------------------------------------------- logs
-def _get_logs_range(start, end, depth=0):
-    """Fetch logs for [start, end], auto-bisecting if the provider rejects the
-    range (too wide / too many results -> HTTP 400 on Alchemy & others)."""
-    try:
-        return rpc("eth_getLogs", [{
-            "address": POOL,
-            "fromBlock": hex(start),
-            "toBlock": hex(end),
-        }])
-    except Exception as e:
-        if start >= end or depth > 40:
-            raise RuntimeError(f"eth_getLogs failed for [{start},{end}]: {e}")
-        mid = (start + end) // 2
-        return _get_logs_range(start, mid, depth + 1) + _get_logs_range(mid + 1, end, depth + 1)
+def _logs_for(start, end):
+    return rpc("eth_getLogs", [{
+        "address": POOL,
+        "fromBlock": hex(start),
+        "toBlock": hex(end),
+    }])
+
+
+def _suggested_window(msg):
+    """Some providers (Alchemy) reply with the largest range they'd accept,
+    e.g. '... should work: [0x.., 0x..]'. Parse it to learn the cap."""
+    m = re.search(r"\[(0x[0-9a-fA-F]+)\s*,\s*(0x[0-9a-fA-F]+)\]", str(msg))
+    if m:
+        return max(1, int(m.group(2), 16) - int(m.group(1), 16) + 1)
+    return None
+
+
+def _learn_window(start):
+    """Find the largest block window the RPC will accept for eth_getLogs."""
+    for w in (CHUNK, 2000, 1000, 100, 10):
+        try:
+            _logs_for(start, start + w - 1)
+            return w
+        except Exception as e:
+            sug = _suggested_window(e)
+            if sug:
+                return sug
+    return 1
 
 
 def get_logs():
     latest = int(rpc("eth_blockNumber", []), 16)
+    win = _learn_window(DEPLOY_BLOCK)
+    ranges = []
+    s = DEPLOY_BLOCK
+    while s <= latest:
+        e = min(s + win - 1, latest)
+        ranges.append((s, e))
+        s = e + 1
+    total = len(ranges)
+    print(f"  scanning {latest - DEPLOY_BLOCK + 1:,} blocks in {total:,} window(s) "
+          f"of {win} (RPC cap)…", file=sys.stderr)
+    if total > 800:
+        print("  [!] free-tier RPC forces a tiny window; this may take a few "
+              "minutes. A wider-range RPC would be much faster.", file=sys.stderr)
+
     logs = []
-    start = DEPLOY_BLOCK
-    while start <= latest:
-        end = min(start + CHUNK, latest)
-        logs.extend(_get_logs_range(start, end))
-        start = end + 1
+    done = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        futs = {ex.submit(_logs_for, a, b): (a, b) for a, b in ranges}
+        for f in concurrent.futures.as_completed(futs):
+            logs.extend(f.result())
+            done += 1
+            if done % 100 == 0 or done == total:
+                print(f"  …{done:,}/{total:,} windows", file=sys.stderr)
     return logs, latest
 
 
