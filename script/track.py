@@ -98,7 +98,11 @@ def rpc(method, params):
     global _id
     _id += 1
     body = json.dumps({"jsonrpc": "2.0", "id": _id, "method": method, "params": params}).encode()
-    req = urllib.request.Request(RPC, data=body, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(RPC, data=body, headers={
+        "Content-Type": "application/json",
+        # Some public RPCs (Cloudflare-fronted) 403 the default urllib UA.
+        "User-Agent": "Mozilla/5.0 (track.py)",
+    })
     for attempt in range(5):
         try:
             r = json.loads(urllib.request.urlopen(req, timeout=60).read())
