@@ -25,6 +25,7 @@ ACCT = "0x32507c0d4182F39e5CFc5C4BF51fC55D594eDa88"
 USDC_VAULT = "0x797DD80692c3b2dAdabCe8e30C07fDE5307D48a9"
 USDT_VAULT = "0x313603FA690301b0CaeEf8069c065862f9162162"
 DEPLOY_BLOCK = 25276348
+DEPLOY_TX = "0x41ea19244db5a2d87e3682268bbd434b510cb7dddc2438d16e4d82df4c394237"
 INITIAL_USD = 200  # initial deposit, USD
 CHUNK = 2000       # preferred eth_getLogs window; auto-shrinks to the RPC's cap
 WORKERS = 12       # parallel eth_getLogs requests (helps when the cap is tiny)
@@ -185,12 +186,11 @@ def vault_rates(vault):
 
 
 # ---------------------------------------------------------------- logs
-def _logs_for(start, end):
-    return rpc("eth_getLogs", [{
-        "address": POOL,
-        "fromBlock": hex(start),
-        "toBlock": hex(end),
-    }])
+def _logs_for(start, end, address, topics):
+    flt = {"address": address, "fromBlock": hex(start), "toBlock": hex(end)}
+    if topics:
+        flt["topics"] = topics
+    return rpc("eth_getLogs", [flt])
 
 
 def _suggested_window(msg):
@@ -202,7 +202,7 @@ def _suggested_window(msg):
     return None
 
 
-def _learn_window(start, latest):
+def _learn_window(start, latest, address, topics):
     """Find the largest block window the RPC will accept for eth_getLogs.
     Tries the WHOLE span first — most RPCs cap by result *size*, not block
     *count*, so a low-traffic pool comes back in a single request."""
@@ -211,7 +211,7 @@ def _learn_window(start, latest):
         if w > full:
             continue
         try:
-            _logs_for(start, start + w - 1)
+            _logs_for(start, start + w - 1, address, topics)
             return w
         except Exception as e:
             sug = _suggested_window(e)
@@ -220,9 +220,8 @@ def _learn_window(start, latest):
     return 1
 
 
-def get_logs():
-    latest = int(rpc("eth_blockNumber", []), 16)
-    win = _learn_window(DEPLOY_BLOCK, latest)
+def get_logs(address, latest, topics=None):
+    win = _learn_window(DEPLOY_BLOCK, latest, address, topics)
     ranges = []
     s = DEPLOY_BLOCK
     while s <= latest:
@@ -231,7 +230,7 @@ def get_logs():
         s = e + 1
     total = len(ranges)
     print(f"  scanning {latest - DEPLOY_BLOCK + 1:,} blocks in {total:,} window(s) "
-          f"of {win:,} (RPC getLogs cap)…", file=sys.stderr)
+          f"of {win:,} for {address[:10]}…", file=sys.stderr)
     if total > 500:
         print(f"\n  [!] This RPC caps getLogs at a tiny {win}-block window, so the "
               f"sweep needs {total:,} requests and will likely hit rate limits.\n"
@@ -243,18 +242,23 @@ def get_logs():
     done = 0
     workers = WORKERS if total > 1 else 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_logs_for, a, b): (a, b) for a, b in ranges}
+        futs = {ex.submit(_logs_for, a, b, address, topics): (a, b) for a, b in ranges}
         for f in concurrent.futures.as_completed(futs):
             logs.extend(f.result())
             done += 1
             if total > 1 and (done % 100 == 0 or done == total):
                 print(f"  …{done:,}/{total:,} windows", file=sys.stderr)
-    return logs, latest
+    return logs
 
 
 def words(hexdata):
     h = hexdata[2:]
     return [int(h[i * 64:(i + 1) * 64], 16) for i in range(len(h) // 64)]
+
+
+def s256(w):
+    """Interpret a 256-bit word as a signed (two's-complement) integer."""
+    return w - (1 << 256) if w >= (1 << 255) else w
 
 
 # Candidate Swap signatures (V2 carries fees; V1 is Uniswap-style). Keyed by
@@ -268,9 +272,40 @@ SWAP_SIGS = {
         {"words": 6, "fees": False},
 }
 
+# Uniswap v4: aggregator-routed swaps emit THIS from the PoolManager, keyed by
+# pool-id — they would not show up under the pool's own address.
+POOL_MANAGER = "0x000000000004444c5dc75cB358380D2e3dE08A90"
+V4_SWAP_TOPIC = topic("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)")
+V4_INIT_TOPIC = topic("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)")
+
+
+def find_pool_id(latest):
+    """Derive this pool's Uniswap v4 pool-id from the v4 Initialize event.
+    First try the deploy tx receipt (one call); else scan PoolManager logs."""
+    try:
+        rc = rpc("eth_getTransactionReceipt", [DEPLOY_TX])
+        for lg in (rc or {}).get("logs", []):
+            if (lg["address"].lower() == POOL_MANAGER.lower()
+                    and lg["topics"] and lg["topics"][0].lower() == V4_INIT_TOPIC.lower()):
+                return lg["topics"][1]
+    except Exception:
+        pass
+    # Fallback: find the Initialize whose hooks field == our pool address.
+    try:
+        inits = get_logs(POOL_MANAGER, latest, topics=[V4_INIT_TOPIC])
+        for lg in inits:
+            w = words(lg["data"])
+            # data: fee, tickSpacing, hooks, sqrtPriceX96, tick -> hooks is word[2]
+            if len(w) >= 3 and ("%040x" % w[2]).lower().endswith(POOL[2:].lower()):
+                return lg["topics"][1]
+    except Exception:
+        pass
+    return None
+
 
 def main():
     print(f"RPC: {RPC.split('/v2/')[0]}…\n")
+
 
     usdc_sup, usdt_sup = supplied(USDC_VAULT), supplied(USDT_VAULT)
     usdc_debt, usdt_debt = debt(USDC_VAULT), debt(USDT_VAULT)
@@ -301,47 +336,68 @@ def main():
     except Exception as e:
         print(f"\n[carry economics unavailable: {e}]")
 
-    logs, latest = get_logs()
+    latest = int(rpc("eth_blockNumber", []), 16)
+
+    # ---- (A) the pool's OWN Swap events (direct, v2-style entry) ----
+    logs = get_logs(POOL, latest)
     by_topic = {}
     for lg in logs:
         t0 = lg["topics"][0] if lg["topics"] else "(anon)"
         by_topic[t0] = by_topic.get(t0, 0) + 1
 
     v_usdc = v_usdt = f_usdc = f_usdt = nswaps = 0
-    matched = False
+    swap_rows = []
     for lg in logs:
         t0 = lg["topics"][0] if lg["topics"] else None
         meta = SWAP_SIGS.get(t0)
         if not meta:
             continue
-        matched = True
         w = words(lg["data"])
         if len(w) < 4:
             continue
         nswaps += 1
-        v_usdc += w[0] + w[2]   # amount0In + amount0Out
-        v_usdt += w[1] + w[3]   # amount1In + amount1Out
+        v_usdc += w[0] + w[2]
+        v_usdt += w[1] + w[3]
         if meta["fees"] and len(w) >= 6:
             f_usdc += w[4]
             f_usdt += w[5]
+        swap_rows.append((int(lg["blockNumber"], 16), lg["transactionHash"]))
 
-    print(f"\n=== Volume served (blocks {DEPLOY_BLOCK}..{latest}) ===")
+    print(f"\n=== Volume served — pool's own Swap events (blocks {DEPLOY_BLOCK}..{latest}) ===")
+    print(f"total logs at pool address = {len(logs)}   (event-topic histogram:)")
+    for t, c in sorted(by_topic.items(), key=lambda x: -x[1]):
+        tag = " <- matched as Swap" if t in SWAP_SIGS else ""
+        print(f"    {t}  x{c}{tag}")
     print(f"swaps          = {nswaps}")
     print(f"USDC volume    = ${v_usdc/1e6:,.2f}")
     print(f"USDT volume    = ${v_usdt/1e6:,.2f}")
-    print(f"total volume   = ${(v_usdc+v_usdt)/1e6:,.2f}")
+    print(f"total volume   = ${(v_usdc+v_usdt)/1e6:,.2f}  (both legs; 1-sided ≈ half)")
     if f_usdc or f_usdt:
         print(f"fees (events)  = ${(f_usdc+f_usdt)/1e6:,.4f}  (USDC {f_usdc/1e6:.4f} + USDT {f_usdt/1e6:.4f})")
-    else:
-        # Fee not in event ABI: derive from the 0.01%/side static fee on volume.
-        est = (v_usdc + v_usdt) * 1e14 / 1e18
-        print(f"fees (est @1bp)= ${est/1e6:,.4f}  (event carries no fee field; estimated from volume)")
+    for blk, tx in swap_rows:
+        print(f"    swap @ block {blk}  tx {tx}")
 
-    if not matched and logs:
-        print("\n[!] No log matched a known Swap signature. Topic histogram:")
-        for t, c in sorted(by_topic.items(), key=lambda x: -x[1]):
-            print(f"    {t}  x{c}")
-        print("    -> inspect the pool ABI and add the correct Swap signature to SWAP_SIGS.")
+    # ---- (B) cross-check via the Uniswap v4 PoolManager (aggregator-routed) ----
+    print("\n=== Cross-check — Uniswap v4 PoolManager swaps (aggregator-routed) ===")
+    pool_id = find_pool_id(latest)
+    if not pool_id:
+        print("  could not derive v4 pool-id; skipping cross-check.")
+        return
+    print(f"  pool-id = {pool_id}")
+    v4 = get_logs(POOL_MANAGER, latest, topics=[V4_SWAP_TOPIC, pool_id])
+    v4_a0 = v4_a1 = 0
+    for lg in v4:
+        w = words(lg["data"])
+        if len(w) < 2:
+            continue
+        v4_a0 += abs(s256(w[0]))
+        v4_a1 += abs(s256(w[1]))
+    print(f"v4 swaps       = {len(v4)}")
+    print(f"USDC volume    = ${v4_a0/1e6:,.2f}")
+    print(f"USDT volume    = ${v4_a1/1e6:,.2f}")
+    print(f"total volume   = ${(v4_a0+v4_a1)/1e6:,.2f}  (both legs; 1-sided ≈ half)")
+    print("\n(If A and B disagree, B — the PoolManager — is the authoritative count "
+          "of all routed swaps; A only sees the pool's direct entry point.)")
 
 
 if __name__ == "__main__":
