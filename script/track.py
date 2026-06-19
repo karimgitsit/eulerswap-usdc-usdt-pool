@@ -27,8 +27,8 @@ USDT_VAULT = "0x313603FA690301b0CaeEf8069c065862f9162162"
 DEPLOY_BLOCK = 25276348
 DEPLOY_TX = "0x41ea19244db5a2d87e3682268bbd434b510cb7dddc2438d16e4d82df4c394237"
 INITIAL_USD = 200  # initial deposit, USD
-CHUNK = 2000       # preferred eth_getLogs window; auto-shrinks to the RPC's cap
-WORKERS = 12       # parallel eth_getLogs requests (helps when the cap is tiny)
+CHUNK = 10_000     # safe fallback eth_getLogs window if the full-span probe fails
+WORKERS = 8        # parallel eth_getLogs requests
 
 
 # ---------------------------------------------------------------- keccak256
@@ -203,21 +203,20 @@ def _suggested_window(msg):
 
 
 def _learn_window(start, latest, address, topics):
-    """Find the largest block window the RPC will accept for eth_getLogs.
-    Tries the WHOLE span first — most RPCs cap by result *size*, not block
-    *count*, so a low-traffic pool comes back in a single request."""
+    """Decide the eth_getLogs window. Try the WHOLE span first — most RPCs cap
+    by result *size*, not block *count*, so a low-traffic pool comes back in a
+    single request. On failure, honor a provider-suggested cap if present;
+    otherwise fall back to a safe fixed CHUNK. NEVER collapse to a tiny window
+    on a transient error (that turns one request into tens of thousands)."""
     full = latest - start + 1
-    for w in (full, 100_000, 10_000, 2000, 1000, 100, 10):
-        if w > full:
-            continue
-        try:
-            _logs_for(start, start + w - 1, address, topics)
-            return w
-        except Exception as e:
-            sug = _suggested_window(e)
-            if sug:
-                return sug
-    return 1
+    try:
+        _logs_for(start, latest, address, topics)
+        return full
+    except Exception as e:
+        sug = _suggested_window(e)
+        if sug:
+            return sug
+    return min(full, CHUNK)
 
 
 def get_logs(address, latest, topics=None):
