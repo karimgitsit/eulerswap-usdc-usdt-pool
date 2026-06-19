@@ -30,6 +30,12 @@ INITIAL_USD = 200  # initial deposit, USD
 CHUNK = 10_000     # safe fallback eth_getLogs window if the full-span probe fails
 WORKERS = 8        # parallel eth_getLogs requests
 
+# Historical getLogs needs an ARCHIVE node. publicnode's free tier now paywalls
+# archive requests, so the log scan rotates through these until one serves them.
+LOG_RPCS = [RPC, "https://eth.llamarpc.com", "https://rpc.ankr.com/eth",
+            "https://eth.drpc.org", "https://eth-mainnet.public.blastapi.io",
+            "https://1rpc.io/eth"]
+
 
 # ---------------------------------------------------------------- keccak256
 def keccak256(data: bytes) -> bytes:
@@ -95,11 +101,11 @@ def topic(sig: str) -> str:
 _id = 0
 
 
-def rpc(method, params):
+def rpc(method, params, url=None):
     global _id
     _id += 1
     body = json.dumps({"jsonrpc": "2.0", "id": _id, "method": method, "params": params}).encode()
-    req = urllib.request.Request(RPC, data=body, headers={
+    req = urllib.request.Request(url or RPC, data=body, headers={
         "Content-Type": "application/json",
         # Some public RPCs (Cloudflare-fronted) 403 the default urllib UA.
         "User-Agent": "Mozilla/5.0 (track.py)",
@@ -186,11 +192,11 @@ def vault_rates(vault):
 
 
 # ---------------------------------------------------------------- logs
-def _logs_for(start, end, address, topics):
+def _logs_for(start, end, address, topics, url):
     flt = {"address": address, "fromBlock": hex(start), "toBlock": hex(end)}
     if topics:
         flt["topics"] = topics
-    return rpc("eth_getLogs", [flt])
+    return rpc("eth_getLogs", [flt], url=url)
 
 
 def _suggested_window(msg):
@@ -202,25 +208,28 @@ def _suggested_window(msg):
     return None
 
 
-def _learn_window(start, latest, address, topics):
-    """Decide the eth_getLogs window. Try the WHOLE span first — most RPCs cap
-    by result *size*, not block *count*, so a low-traffic pool comes back in a
-    single request. On failure, honor a provider-suggested cap if present;
-    otherwise fall back to a safe fixed CHUNK. NEVER collapse to a tiny window
-    on a transient error (that turns one request into tens of thousands)."""
+def _learn_window(start, latest, address, topics, url):
+    """Decide the eth_getLogs window on `url`. Try the WHOLE span first — most
+    RPCs cap by result *size*, not block *count*, so a low-traffic pool comes
+    back in one request. On failure honor a provider-suggested cap if present,
+    else fall back to a safe fixed CHUNK. Re-raises if the FIRST historical
+    probe fails outright (e.g. archive paywall) so the caller can try next RPC."""
     full = latest - start + 1
     try:
-        _logs_for(start, latest, address, topics)
+        _logs_for(start, latest, address, topics, url)
         return full
     except Exception as e:
         sug = _suggested_window(e)
         if sug:
             return sug
-    return min(full, CHUNK)
+        # Confirm this RPC serves historical logs at all (small probe); if not,
+        # raise so the caller rotates to the next endpoint.
+        _logs_for(start, min(start + 50, latest), address, topics, url)
+        return min(full, CHUNK)
 
 
-def get_logs(address, latest, topics=None):
-    win = _learn_window(DEPLOY_BLOCK, latest, address, topics)
+def _sweep(address, latest, topics, url):
+    win = _learn_window(DEPLOY_BLOCK, latest, address, topics, url)
     ranges = []
     s = DEPLOY_BLOCK
     while s <= latest:
@@ -228,26 +237,32 @@ def get_logs(address, latest, topics=None):
         ranges.append((s, e))
         s = e + 1
     total = len(ranges)
-    print(f"  scanning {latest - DEPLOY_BLOCK + 1:,} blocks in {total:,} window(s) "
-          f"of {win:,} for {address[:10]}…", file=sys.stderr)
-    if total > 500:
-        print(f"\n  [!] This RPC caps getLogs at a tiny {win}-block window, so the "
-              f"sweep needs {total:,} requests and will likely hit rate limits.\n"
-              f"      Re-run against a wider-range RPC, e.g.:\n"
-              f"        MAINNET_RPC_URL='https://ethereum-rpc.publicnode.com' "
-              f"python3 script/track.py\n", file=sys.stderr)
-
     logs = []
-    done = 0
     workers = WORKERS if total > 1 else 1
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(_logs_for, a, b, address, topics): (a, b) for a, b in ranges}
+        futs = [ex.submit(_logs_for, a, b, address, topics, url) for a, b in ranges]
         for f in concurrent.futures.as_completed(futs):
             logs.extend(f.result())
-            done += 1
-            if total > 1 and (done % 100 == 0 or done == total):
-                print(f"  …{done:,}/{total:,} windows", file=sys.stderr)
-    return logs
+    return logs, win, total
+
+
+def get_logs(address, latest, topics=None, prefer=None):
+    """Fetch logs, rotating through LOG_RPCS until one serves the historical
+    range. Returns (logs, url_used)."""
+    candidates = ([prefer] + [u for u in LOG_RPCS if u != prefer]) if prefer else LOG_RPCS
+    last_err = None
+    for url in candidates:
+        try:
+            logs, win, total = _sweep(address, latest, topics, url)
+            print(f"  [{url.split('//')[-1].split('/')[0]}] {latest - DEPLOY_BLOCK + 1:,} "
+                  f"blocks in {total:,}×{win:,} -> {len(logs)} logs for {address[:10]}…",
+                  file=sys.stderr)
+            return logs, url
+        except Exception as e:
+            host = url.split('//')[-1].split('/')[0]
+            print(f"  [{host}] no archive logs ({str(e)[:80]}); trying next…", file=sys.stderr)
+            last_err = e
+    raise RuntimeError(f"all log RPCs failed for {address}: {last_err}")
 
 
 def words(hexdata):
@@ -278,20 +293,22 @@ V4_SWAP_TOPIC = topic("Swap(bytes32,address,int128,int128,uint160,uint128,int24,
 V4_INIT_TOPIC = topic("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)")
 
 
-def find_pool_id(latest):
+def find_pool_id(latest, prefer=None):
     """Derive this pool's Uniswap v4 pool-id from the v4 Initialize event.
     First try the deploy tx receipt (one call); else scan PoolManager logs."""
-    try:
-        rc = rpc("eth_getTransactionReceipt", [DEPLOY_TX])
-        for lg in (rc or {}).get("logs", []):
-            if (lg["address"].lower() == POOL_MANAGER.lower()
-                    and lg["topics"] and lg["topics"][0].lower() == V4_INIT_TOPIC.lower()):
-                return lg["topics"][1]
-    except Exception:
-        pass
+    for url in ([prefer] + [u for u in LOG_RPCS if u != prefer]) if prefer else LOG_RPCS:
+        try:
+            rc = rpc("eth_getTransactionReceipt", [DEPLOY_TX], url=url)
+            for lg in (rc or {}).get("logs", []):
+                if (lg["address"].lower() == POOL_MANAGER.lower()
+                        and lg["topics"] and lg["topics"][0].lower() == V4_INIT_TOPIC.lower()):
+                    return lg["topics"][1]
+            break  # receipt fetched but no Initialize log -> use scan fallback
+        except Exception:
+            continue
     # Fallback: find the Initialize whose hooks field == our pool address.
     try:
-        inits = get_logs(POOL_MANAGER, latest, topics=[V4_INIT_TOPIC])
+        inits, _ = get_logs(POOL_MANAGER, latest, topics=[V4_INIT_TOPIC], prefer=prefer)
         for lg in inits:
             w = words(lg["data"])
             # data: fee, tickSpacing, hooks, sqrtPriceX96, tick -> hooks is word[2]
@@ -338,7 +355,7 @@ def main():
     latest = int(rpc("eth_blockNumber", []), 16)
 
     # ---- (A) the pool's OWN Swap events (direct, v2-style entry) ----
-    logs = get_logs(POOL, latest)
+    logs, log_rpc = get_logs(POOL, latest)
     by_topic = {}
     for lg in logs:
         t0 = lg["topics"][0] if lg["topics"] else "(anon)"
@@ -378,12 +395,12 @@ def main():
 
     # ---- (B) cross-check via the Uniswap v4 PoolManager (aggregator-routed) ----
     print("\n=== Cross-check — Uniswap v4 PoolManager swaps (aggregator-routed) ===")
-    pool_id = find_pool_id(latest)
+    pool_id = find_pool_id(latest, prefer=log_rpc)
     if not pool_id:
         print("  could not derive v4 pool-id; skipping cross-check.")
         return
     print(f"  pool-id = {pool_id}")
-    v4 = get_logs(POOL_MANAGER, latest, topics=[V4_SWAP_TOPIC, pool_id])
+    v4, _ = get_logs(POOL_MANAGER, latest, topics=[V4_SWAP_TOPIC, pool_id], prefer=log_rpc)
     v4_a0 = v4_a1 = 0
     for lg in v4:
         w = words(lg["data"])
