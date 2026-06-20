@@ -74,4 +74,25 @@ forge script script/DeployStablePool.s.sol:DeployStablePool \
 - **Retune fee / concentration / reserves without redeploying:** `pool.reconfigure(dParams, initialState)`
   from the euler account (same pool address).
 
+## Closing the position / withdrawing your cash
+The position is leveraged — USDT supplied as collateral against a USDC debt — so you can't just
+"withdraw": the health check blocks pulling collateral while the debt is open, and you don't hold the
+USDC to repay outright. `script/ClosePool.s.sol` does the full unwind atomically with **no outside
+capital**: pause the pool → (in one EVC batch, health deferred) pull all USDT collateral, swap it to
+USDC on Uniswap v3, repay the USDC debt in full → withdraw the remaining ~equity to you → drop the
+controller/collateral/operator. You end with your equity (~$equity) in USDC.
+
+```shell
+# 1) ALWAYS dry-run on a fork first — runs the exact close against your REAL live position:
+forge test --mc ForkClose -vvv --fork-url $MAINNET_RPC_URL
+
+# 2) Broadcast (sign with your own keystore/hardware wallet; never a raw key):
+RECIPIENT=0xYourWallet \
+forge script script/ClosePool.s.sol:ClosePool \
+  --rpc-url $MAINNET_RPC_URL --account <name> --sender 0xYourOwner --broadcast --slow
+```
+The pool contract stays deployed but is inert once the account is empty (nothing to borrow against).
+`track.py` quantifies what you'll recover (`NAV (equity)`). Slippage floor = repaying the full debt,
+so the swap reverts rather than under-repaying.
+
 This is leveraged and carries liquidation risk. Not financial advice.
